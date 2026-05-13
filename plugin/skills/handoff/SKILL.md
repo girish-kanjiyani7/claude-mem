@@ -1,111 +1,152 @@
 ---
 name: handoff
-description: Generate a HANDOFF.md that captures goal, current state, files touched, failed attempts, and next steps — so a fresh Claude session can continue exactly where this one left off. Use when sessions are getting long, Claude keeps retrying the same broken solution, or the user wants to step away and resume later.
+description: Generate a HANDOFF.md grounded in claude-mem's recorded observation data — recent changes, bugfixes attempted, files touched, and current session context — so a fresh Claude session can continue exactly where this one left off. Use when the user wants to stop and resume later, or when Claude is stuck repeating the same failing approach.
 ---
 
 # Handoff
 
-Generate a structured `HANDOFF.md` file that gives a fresh Claude session everything it needs to continue this work without dragging the current degraded context forward.
+Generate a `HANDOFF.md` file grounded in claude-mem's actual recorded data for this project. Unlike `/clear` + "continue" (which relies on automatic timeline injection), `/handoff` produces a portable, human-readable briefing doc that works even when stepping away for hours, switching machines, or when the current session is so degraded that you need a clean break with explicit direction about what NOT to try again.
 
 ## When to Use
 
-- The session is long and Claude feels confused or repetitive
-- Claude keeps trying the same failing solution over and over
-- The user wants to step away and resume later
-- `/compact` ran but Claude still lacks clear direction
-- The user says "handoff", "generate a handoff", "I want to start fresh", or "write a handoff doc"
+- Stepping away and resuming later (no session continuity via injection)
+- Claude is stuck retrying the same failing approach — the handoff explicitly flags what NOT to try again
+- The user wants a reviewable, shareable record of where things stand
+- The user says "handoff", "generate a handoff", "write a handoff doc", "I want to start fresh"
 
-## What to Capture
+## Step 1: Resolve the Worker Port
 
-Think hard about the full arc of this conversation before writing. The handoff must be useful to a Claude instance that has never seen this conversation.
+```bash
+WORKER_PORT="${CLAUDE_MEM_WORKER_PORT:-$(node -e "const fs=require('fs'),p=require('path'),os=require('os');const uid=(typeof process.getuid==='function'?process.getuid():77);const fallback=String(37700+(uid%100));try{const s=JSON.parse(fs.readFileSync(p.join(os.homedir(),'.claude-mem','settings.json'),'utf-8'));process.stdout.write(String(s.CLAUDE_MEM_WORKER_PORT||fallback));}catch{process.stdout.write(fallback);}" 2>/dev/null)}"
+```
 
-### Required Sections
+Verify the worker is running:
 
-1. **Goal** — One paragraph. What is the user actually trying to accomplish? State the end state, not the current sub-task. Be specific enough that a fresh agent can orient immediately.
+```bash
+curl -s "http://localhost:${WORKER_PORT}/api/health" | head -c 100
+```
 
-2. **Current State** — What is working right now? What is broken? What is the exact symptom of the problem? Include error messages verbatim if relevant.
+If the worker is not running, note it and fall back to conversation context only (see Notes).
 
-3. **Files in Play** — List every file that has been read, edited, or created during this session that is relevant to the current task. Use absolute or repo-relative paths. Include a one-line note on why each file matters.
+## Step 2: Determine the Project Name
 
-4. **What Has Been Tried (and Why It Failed)** — This is the most important section. List every approach attempted that did not work, and explain WHY it failed (not just that it failed). A fresh agent that skips this section will repeat the same mistakes.
+Use the current working directory's basename. Check for git worktrees first:
 
-5. **Current Best Theory** — What do you currently believe is the right path forward, even if you haven't proven it yet? Include any evidence or reasoning that supports it.
+```bash
+git_dir=$(git rev-parse --git-dir 2>/dev/null)
+git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null)
+if [ "$git_dir" != "$git_common_dir" ]; then
+  PROJECT=$(basename "$(dirname "$git_common_dir")")
+else
+  PROJECT=$(basename "$PWD")
+fi
+echo "$PROJECT"
+```
 
-6. **Next Steps** — Concrete, ordered actions for the fresh agent to take. Be specific: file paths, function names, commands to run. The fresh agent should be able to start on step 1 immediately.
+## Step 3: Pull Data from claude-mem
 
-7. **Key Constraints and Context** — Any non-obvious constraints: environment specifics, user preferences expressed during this session, things the user explicitly said NOT to do, external dependencies, performance requirements, etc.
+Run these in parallel to gather the raw material for the handoff:
 
-## Writing Rules
+**Recent context — what claude-mem knows about the current state:**
+```bash
+curl -s "http://localhost:${WORKER_PORT}/api/context/recent?project=${PROJECT}&limit=20"
+```
 
-- Write the handoff for a fresh Claude, not for the user. The user knows what happened; the fresh Claude does not.
-- Be ruthlessly specific. Vague next steps are useless. "Fix the auth" is bad. "In `src/auth/middleware.ts:47`, the token expiry check uses `Date.now()` but should use `req.timestamp` — change the comparison on line 52" is good.
-- Include exact error messages, stack traces, or test output that captures the failure mode.
-- Do not pad. Every sentence should be load-bearing information for the fresh agent.
-- Do not write the handoff from the user's perspective. Write it as a briefing document addressed to the incoming agent.
+**Bugfix observations — what was tried and failed:**
+```bash
+curl -s "http://localhost:${WORKER_PORT}/api/search/by-type?type=bugfix&project=${PROJECT}&limit=15&orderBy=date_desc"
+```
 
-## Output
+**Recent changes — what files and code actually changed:**
+```bash
+curl -s "http://localhost:${WORKER_PORT}/api/changes?project=${PROJECT}&limit=15"
+```
 
-Write the handoff to `HANDOFF.md` in the current working directory (the project root).
+**Recent decisions — architecture choices, approach selections:**
+```bash
+curl -s "http://localhost:${WORKER_PORT}/api/decisions?project=${PROJECT}&limit=10"
+```
 
-Use this structure:
+**Current git state:**
+```bash
+git status --short && echo "---" && git log --oneline -5
+```
+
+## Step 4: Synthesize and Write HANDOFF.md
+
+Using the data from Step 3 plus current conversation context, write `HANDOFF.md` to the project root. The doc is addressed to an incoming Claude agent that has never seen this conversation.
 
 ```markdown
 # Handoff
 
-> Generated: [timestamp]  
-> Project: [project name or directory]  
-> Session summary: [one sentence describing what this session was about]
+> Generated: [ISO timestamp]
+> Project: [project name]
+> Based on [N] recorded observations from claude-mem
 
 ## Goal
 
-[What the user is trying to accomplish — the actual end state]
+[What the user is trying to accomplish — the actual end state, not the current sub-task.
+One paragraph. Specific enough that a fresh agent can orient in 10 seconds.]
 
 ## Current State
 
 **Working:**
-- [list what is confirmed working]
+- [Confirmed working — be specific, cite files if relevant]
 
-**Broken:**
-- [exact symptom, error message, or failure mode]
+**Broken / Blocked:**
+- [Exact symptom or error. Paste error messages verbatim if available from observations.]
+
+**Git status:**
+- [Uncommitted changes, current branch, last 3 commits]
 
 ## Files in Play
 
-| File | Why It Matters |
-|------|---------------|
-| `path/to/file.ts` | [one line] |
+| File | Status | Why It Matters |
+|------|--------|---------------|
+| `path/to/file` | modified / created / read | [one line] |
 
-## What Has Been Tried (and Why It Failed)
+*Derived from claude-mem change observations and current git status.*
 
-### Attempt 1: [short name]
+## What Has Been Tried (Do Not Repeat)
+
+*Sourced from claude-mem bugfix observations for this project.*
+
+### [Attempt name from observation title]
 - **What:** [what was done]
-- **Why it failed:** [root cause, not just "it didn't work"]
+- **Why it failed:** [root cause from observation narrative/facts]
 
-### Attempt 2: [short name]
-...
+### [Next attempt...]
 
 ## Current Best Theory
 
-[What you currently believe is the correct approach and why]
+[The most promising path forward based on recent decisions and discoveries.
+Include the reasoning — what evidence points here.]
 
 ## Next Steps
 
-1. [Specific, actionable step with file path or command]
+1. [Specific action — file path, function name, command to run]
 2. [Next step]
 3. ...
 
 ## Key Constraints
 
-- [Non-obvious constraint or preference the user expressed]
-- [Things explicitly ruled out]
+*From claude-mem observations and this session:*
+- [Non-obvious constraint or user preference]
+- [Things explicitly ruled out — reference the failed attempt above]
 ```
 
-## After Writing
+## Step 5: Tell the User
 
-Tell the user:
+After writing:
 
-1. That `HANDOFF.md` has been written
-2. To run `/clear` or start a new Claude Code session
-3. To open the new session and say: **"Read HANDOFF.md and continue from where we left off."**
-4. That the fresh agent will have no memory of this session, so the handoff doc is its only briefing
+> `HANDOFF.md` written to `[path]`.
+> 1. Run `/clear` or start a new Claude Code session
+> 2. Say: **"Read HANDOFF.md and continue from where we left off"**
+>
+> The "What Has Been Tried" section is sourced from your claude-mem bugfix observations — the fresh agent won't repeat the same mistakes.
 
-Keep the message short. The user is ready to move — don't make them read a wall of text.
+## Notes
+
+- **Worker unavailable:** Fall back to synthesizing from conversation context alone. Add this banner to the top of the doc: `> ⚠️ claude-mem worker unavailable — based on conversation context only, not recorded observations.`
+- Keep the handoff under ~150 lines. Dense and specific beats long and vague.
+- The "What Has Been Tried" section is the most important — it's what separates this from a plain `/clear` + "continue".
