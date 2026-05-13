@@ -1,36 +1,26 @@
 ---
 name: handoff
-description: Generate a HANDOFF.md grounded in claude-mem's recorded observation data — recent changes, bugfixes attempted, files touched, and current session context — so a fresh Claude session can continue exactly where this one left off. Use when the user wants to stop and resume later, or when Claude is stuck repeating the same failing approach.
+description: Generate a HANDOFF.md grounded in claude-mem's recorded observations — using the MCP search/timeline/get_observations tools to surface recent bugfixes, changes, decisions, and files touched — so a fresh Claude session can continue exactly where this one left off without repeating failed approaches. Use when stepping away, or when Claude is stuck in a loop.
 ---
 
 # Handoff
 
-Generate a `HANDOFF.md` file grounded in claude-mem's actual recorded data for this project. Unlike `/clear` + "continue" (which relies on automatic timeline injection), `/handoff` produces a portable, human-readable briefing doc that works even when stepping away for hours, switching machines, or when the current session is so degraded that you need a clean break with explicit direction about what NOT to try again.
+Generate a `HANDOFF.md` file grounded in claude-mem's actual recorded observations for this project. Uses the same MCP tool workflow as `/mem-search` — search → filter → fetch — to pull real data: what changed, what failed, what was decided. The result is a portable briefing doc a fresh session can act on immediately.
+
+**Why this differs from `/clear` + "continue":** Timeline injection gives the next session context. Handoff gives it *direction* — specifically what NOT to try again, sourced from actual bugfix observations. That's the gap it fills when someone is stuck in a loop.
 
 ## When to Use
 
-- Stepping away and resuming later (no session continuity via injection)
-- Claude is stuck retrying the same failing approach — the handoff explicitly flags what NOT to try again
-- The user wants a reviewable, shareable record of where things stand
-- The user says "handoff", "generate a handoff", "write a handoff doc", "I want to start fresh"
+- Claude is stuck retrying the same failing approach
+- Stepping away and resuming hours or days later
+- The user wants a reviewable record of current state
+- The user says "handoff", "write a handoff doc", "I want to start fresh"
 
-## Step 1: Resolve the Worker Port
+## Workflow
 
-```bash
-WORKER_PORT="${CLAUDE_MEM_WORKER_PORT:-$(node -e "const fs=require('fs'),p=require('path'),os=require('os');const uid=(typeof process.getuid==='function'?process.getuid():77);const fallback=String(37700+(uid%100));try{const s=JSON.parse(fs.readFileSync(p.join(os.homedir(),'.claude-mem','settings.json'),'utf-8'));process.stdout.write(String(s.CLAUDE_MEM_WORKER_PORT||fallback));}catch{process.stdout.write(fallback);}" 2>/dev/null)}"
-```
+### Step 1: Determine the Project Name
 
-Verify the worker is running:
-
-```bash
-curl -s "http://localhost:${WORKER_PORT}/api/health" | head -c 100
-```
-
-If the worker is not running, note it and fall back to conversation context only (see Notes).
-
-## Step 2: Determine the Project Name
-
-Use the current working directory's basename. Check for git worktrees first:
+Check for git worktrees before using the directory basename:
 
 ```bash
 git_dir=$(git rev-parse --git-dir 2>/dev/null)
@@ -43,110 +33,127 @@ fi
 echo "$PROJECT"
 ```
 
-## Step 3: Pull Data from claude-mem
+### Step 2: Gather Observations (3-Layer MCP Workflow)
 
-Run these in parallel to gather the raw material for the handoff:
+**NEVER fetch full observation details without filtering first. Follow the search → filter → fetch pattern.**
 
-**Recent context — what claude-mem knows about the current state:**
-```bash
-curl -s "http://localhost:${WORKER_PORT}/api/context/recent?project=${PROJECT}&limit=20"
+#### 2a. Search — get index tables for each observation type
+
+Run these searches using the `search` MCP tool:
+
+```
+search(query="*", type="observations", obs_type="bugfix", project=PROJECT, limit=20, orderBy="date_desc")
+```
+```
+search(query="*", type="observations", obs_type="change", project=PROJECT, limit=20, orderBy="date_desc")
+```
+```
+search(query="*", type="observations", obs_type="decision", project=PROJECT, limit=10, orderBy="date_desc")
 ```
 
-**Bugfix observations — what was tried and failed:**
-```bash
-curl -s "http://localhost:${WORKER_PORT}/api/search/by-type?type=bugfix&project=${PROJECT}&limit=15&orderBy=date_desc"
+Each returns a compact index (~50-100 tokens/row). Review titles and timestamps — discard anything clearly unrelated to the current task.
+
+#### 2b. Timeline — get narrative arc around the most recent work
+
+Use the `timeline` MCP tool to understand what happened leading up to now:
+
+```
+timeline(query="recent work", depth_before=10, depth_after=2, project=PROJECT)
 ```
 
-**Recent changes — what files and code actually changed:**
-```bash
-curl -s "http://localhost:${WORKER_PORT}/api/changes?project=${PROJECT}&limit=15"
+This shows sessions, observations, and prompts interleaved — use it to understand the sequence of attempts, not just isolated observations.
+
+#### 2c. Fetch — get full details only for relevant IDs
+
+After reviewing the index from 2a and narrative from 2b, select the IDs that matter. Discard the rest.
+
+```
+get_observations(ids=[ID1, ID2, ID3, ...], project=PROJECT)
 ```
 
-**Recent decisions — architecture choices, approach selections:**
+Use `get_observations` for all selected IDs in a single call. Returns full narrative, facts, files_modified, and concepts (~500-1000 tokens each) — only fetch what you'll actually use in the handoff.
+
+Also get current git state:
+
 ```bash
-curl -s "http://localhost:${WORKER_PORT}/api/decisions?project=${PROJECT}&limit=10"
+git status --short && git log --oneline -5
 ```
 
-**Current git state:**
-```bash
-git status --short && echo "---" && git log --oneline -5
-```
+### Step 3: Synthesize and Write HANDOFF.md
 
-## Step 4: Synthesize and Write HANDOFF.md
-
-Using the data from Step 3 plus current conversation context, write `HANDOFF.md` to the project root. The doc is addressed to an incoming Claude agent that has never seen this conversation.
+Write `HANDOFF.md` to the project root. Address it to an incoming Claude agent that has never seen this conversation. Every section must be specific enough to act on immediately.
 
 ```markdown
 # Handoff
 
 > Generated: [ISO timestamp]
 > Project: [project name]
-> Based on [N] recorded observations from claude-mem
+> Observations reviewed: [N bugfix] bugfixes · [N change] changes · [N decision] decisions
 
 ## Goal
 
-[What the user is trying to accomplish — the actual end state, not the current sub-task.
-One paragraph. Specific enough that a fresh agent can orient in 10 seconds.]
+[What the user is trying to accomplish — the end state, not the current sub-task.
+One paragraph. Specific enough that a fresh agent orients in 10 seconds.]
 
 ## Current State
 
 **Working:**
-- [Confirmed working — be specific, cite files if relevant]
+- [Confirmed working — cite files/functions if relevant]
 
 **Broken / Blocked:**
-- [Exact symptom or error. Paste error messages verbatim if available from observations.]
+- [Exact symptom or error verbatim from observations or conversation]
 
 **Git status:**
-- [Uncommitted changes, current branch, last 3 commits]
+- Branch: [branch name]
+- Uncommitted: [list or "clean"]
+- Last commits: [3 one-liners from git log]
 
 ## Files in Play
 
 | File | Status | Why It Matters |
-|------|--------|---------------|
-| `path/to/file` | modified / created / read | [one line] |
+|------|--------|----------------|
+| `path/to/file` | modified / created / read | [one line from change observations] |
 
-*Derived from claude-mem change observations and current git status.*
+*Sourced from claude-mem change observations + git status.*
 
 ## What Has Been Tried (Do Not Repeat)
 
-*Sourced from claude-mem bugfix observations for this project.*
+*Sourced from claude-mem bugfix observations.*
 
-### [Attempt name from observation title]
-- **What:** [what was done]
-- **Why it failed:** [root cause from observation narrative/facts]
+### [Observation title]
+- **What:** [what was attempted — from observation facts]
+- **Why it failed:** [root cause — from observation narrative, not just "it didn't work"]
 
-### [Next attempt...]
+### [Next observation...]
 
 ## Current Best Theory
 
-[The most promising path forward based on recent decisions and discoveries.
-Include the reasoning — what evidence points here.]
+[Most promising path forward, drawn from recent decision observations and discoveries.
+Include the reasoning — what evidence points here. If no clear theory exists, say so explicitly.]
 
 ## Next Steps
 
-1. [Specific action — file path, function name, command to run]
+1. [Specific, actionable — include file path or command]
 2. [Next step]
 3. ...
 
 ## Key Constraints
 
-*From claude-mem observations and this session:*
-- [Non-obvious constraint or user preference]
-- [Things explicitly ruled out — reference the failed attempt above]
+*From claude-mem observations:*
+- [Non-obvious constraint or preference surfaced in observations]
+- [Explicitly ruled-out approaches — link back to the failed attempts above]
 ```
 
-## Step 5: Tell the User
+### Step 4: Tell the User
 
-After writing:
-
-> `HANDOFF.md` written to `[path]`.
+> `HANDOFF.md` written.
 > 1. Run `/clear` or start a new Claude Code session
 > 2. Say: **"Read HANDOFF.md and continue from where we left off"**
 >
-> The "What Has Been Tried" section is sourced from your claude-mem bugfix observations — the fresh agent won't repeat the same mistakes.
+> "What Has Been Tried" is sourced from your recorded bugfix observations — the fresh agent won't repeat the same approaches.
 
 ## Notes
 
-- **Worker unavailable:** Fall back to synthesizing from conversation context alone. Add this banner to the top of the doc: `> ⚠️ claude-mem worker unavailable — based on conversation context only, not recorded observations.`
+- If no bugfix/change/decision observations exist yet for this project, note it in the doc and fall back to synthesizing from conversation context. Add: `> ⚠️ No observations recorded yet — based on conversation context only.`
 - Keep the handoff under ~150 lines. Dense and specific beats long and vague.
-- The "What Has Been Tried" section is the most important — it's what separates this from a plain `/clear` + "continue".
+- The files listed in `get_observations` results include `files_modified` — use those directly for the Files in Play table rather than guessing.
